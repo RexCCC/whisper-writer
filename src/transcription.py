@@ -1,11 +1,13 @@
 import io
 import os
+import shutil
 import numpy as np
 import soundfile as sf
 import importlib.util
 import wave
 import json
 import requests
+from pathlib import Path
 from tqdm import tqdm
 from openai import OpenAI
 from groq import Groq
@@ -87,6 +89,94 @@ def download_vosk_model(model_name: str) -> bool:
         if os.path.exists(zip_path):
             os.remove(zip_path)
         return False
+
+def _whisper_hf_cache_dir(model_name: str) -> Path | None:
+    if not HAS_FASTER_WHISPER:
+        return None
+    from faster_whisper.utils import _MODELS
+
+    repo_id = _MODELS.get(model_name)
+    if not repo_id:
+        return None
+    cache_dir = Path.home() / ".cache" / "huggingface" / "hub" / f"models--{repo_id.replace('/', '--')}"
+    return cache_dir if cache_dir.exists() else None
+
+
+def clear_broken_whisper_cache(model_name: str) -> bool:
+    """Remove HuggingFace cache entries for a faster-whisper model."""
+    return _remove_whisper_hf_cache(model_name)
+
+
+def _remove_whisper_hf_cache(model_name: str) -> bool:
+    cache_dir = _whisper_hf_cache_dir(model_name)
+    if cache_dir is None:
+        return False
+    shutil.rmtree(cache_dir, ignore_errors=True)
+    ConfigManager.console_print(f"Removed model cache: {cache_dir.name}")
+    return True
+
+
+def delete_model_cache(model_name: str) -> bool:
+    """Delete cached files for a local Whisper or Vosk model."""
+    if is_vosk_model(model_name):
+        model_path = Path(get_model_path(model_name))
+        if not model_path.exists():
+            return False
+        shutil.rmtree(model_path, ignore_errors=True)
+        zip_path = Path(str(model_path) + ".zip")
+        if zip_path.exists():
+            zip_path.unlink(missing_ok=True)
+        ConfigManager.console_print(f"Deleted Vosk model cache: {model_name}")
+        return True
+    return _remove_whisper_hf_cache(model_name)
+
+
+def is_model_cached(model_name: str) -> bool:
+    """Return True if the model files are present locally."""
+    if is_vosk_model(model_name):
+        model_path = Path(get_model_path(model_name))
+        return model_path.is_dir() and any(model_path.iterdir())
+
+    if not HAS_FASTER_WHISPER:
+        return False
+
+    try:
+        from faster_whisper.utils import download_model
+
+        download_model(model_name, local_files_only=True)
+        return True
+    except Exception:
+        return False
+
+
+def download_whisper_model(model_name: str) -> tuple:
+    """Download a local model. Returns (success, message)."""
+    if is_vosk_model(model_name):
+        if is_model_cached(model_name):
+            return True, f"{model_name} is already downloaded."
+        if download_vosk_model(model_name):
+            return True, f"Downloaded {model_name}."
+        return False, f"Failed to download {model_name}. Check your internet connection."
+
+    if not HAS_FASTER_WHISPER:
+        return False, "faster-whisper is not installed."
+
+    try:
+        from faster_whisper.utils import download_model
+
+        if is_model_cached(model_name):
+            path = download_model(model_name, local_files_only=True)
+            return True, f"{model_name} is already downloaded at {path}."
+
+        ConfigManager.console_print(f"Downloading {model_name} from Hugging Face...")
+        path = download_model(model_name)
+        if not is_model_cached(model_name):
+            return False, f"Download finished but {model_name} looks incomplete. Try Delete, then Download again."
+        return True, f"Downloaded {model_name} to {path}."
+    except Exception as exc:
+        ConfigManager.console_print(f"Download failed for {model_name}: {exc}")
+        return False, str(exc)
+
 
 def get_optimal_device():
     """
@@ -181,27 +271,46 @@ def create_local_model():
             if device == 'auto':
                 device = get_optimal_device()
 
-        try:
+        def load_whisper():
             if model_path:
                 ConfigManager.console_print(f'Loading Whisper model from: {model_path}')
-                model = WhisperModel(model_path,
-                                   device=device,
-                                   compute_type=compute_type,
-                                   download_root=None)
-            else:
-                model = WhisperModel(local_model_options['model'],
-                                   device=device,
-                                   compute_type=compute_type)
+                return WhisperModel(
+                    model_path,
+                    device=device,
+                    compute_type=compute_type,
+                    download_root=None,
+                )
+            ConfigManager.console_print(
+                f'Loading Whisper model: {local_model_options["model"]} '
+                f'(first run may download several hundred MB)...'
+            )
+            return WhisperModel(
+                local_model_options['model'],
+                device=device,
+                compute_type=compute_type,
+            )
+
+        try:
+            model = load_whisper()
             ConfigManager.console_print('Whisper model created.')
             return ('whisper', model)
         except Exception as e:
+            err = str(e)
             ConfigManager.console_print(f'Error initializing WhisperModel: {e}')
-            ConfigManager.console_print('Falling back to CPU.')
-            model = WhisperModel(model_path or local_model_options['model'],
-                               device='cpu',
-                               compute_type=compute_type,
-                               download_root=None if model_path else None)
-            return ('whisper', model)
+            if not model_path and (
+                'model.bin' in err
+                or 'snapshot folder' in err
+                or 'getaddrinfo failed' in err
+            ):
+                if clear_broken_whisper_cache(model_name):
+                    try:
+                        model = load_whisper()
+                        ConfigManager.console_print('Whisper model created after cache refresh.')
+                        return ('whisper', model)
+                    except Exception as retry_err:
+                        ConfigManager.console_print(f'Retry failed: {retry_err}')
+            ConfigManager.console_print('Local model unavailable; app will start without it.')
+            return None
 
 def transcribe_local(audio_data, local_model=None):
     """Transcribe audio using a local model (Whisper or Vosk)."""

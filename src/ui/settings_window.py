@@ -15,6 +15,8 @@ from utils import ConfigManager
 from keyring_manager import KeyringManager
 from llm_processor import LLMProcessor
 from ui.model_refresh_worker import ModelRefreshWorker
+from ui.local_model_worker import LocalModelWorker
+from transcription import is_model_cached
 
 load_dotenv()
 
@@ -29,6 +31,10 @@ class SettingsWindow(BaseWindow):
         self.llm_processor = None  # Initialize to None
         self.model_combo = None
         self.refresh_thread = None  # Add thread reference
+        self.local_model_worker_thread = None
+        self.local_model_download_btn = None
+        self.local_model_delete_btn = None
+        self.model_cache_status_label = None
         self.init_settings_ui()
         
         # Check if we're in API mode (no GPU tools available)
@@ -121,6 +127,10 @@ class SettingsWindow(BaseWindow):
 
     def add_setting_widget(self, layout, key, meta, category, sub_category=None):
         """Add a setting widget to the layout."""
+        if category == 'model_options' and sub_category == 'local' and key == 'model':
+            self._add_local_model_widget(layout, key, meta, category, sub_category)
+            return
+
         item_layout = QHBoxLayout()
         widget = None
         
@@ -291,6 +301,8 @@ class SettingsWindow(BaseWindow):
         if meta_type == 'bool':
             return self.create_checkbox(current_value, key)
         elif meta_type == 'str' and 'options' in meta:
+            if category == 'model_options' and sub_category == 'local' and key == 'model':
+                return self.create_local_model_selector(current_value, meta)
             return self.create_combobox(current_value, meta['options'])
         elif meta_type == 'str':
             is_api_key = key.endswith('api_key')
@@ -311,6 +323,156 @@ class SettingsWindow(BaseWindow):
         widget.addItems(options)
         widget.setCurrentText(value)
         return widget
+
+    def create_local_model_selector(self, value, meta):
+        """Model dropdown with Download and Delete buttons."""
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        combo = self.create_combobox(value, meta['options'])
+        combo.setObjectName('model_options_local_model_combo')
+        combo.currentTextChanged.connect(self.update_local_model_cache_status)
+
+        self.local_model_download_btn = QPushButton('Download')
+        self.local_model_download_btn.setFont(QFont('Segoe UI', 11))
+        self.local_model_download_btn.clicked.connect(self.download_selected_local_model)
+
+        self.local_model_delete_btn = QPushButton('Delete')
+        self.local_model_delete_btn.setFont(QFont('Segoe UI', 11))
+        self.local_model_delete_btn.clicked.connect(self.delete_selected_local_model)
+
+        layout.addWidget(combo, stretch=1)
+        layout.addWidget(self.local_model_download_btn)
+        layout.addWidget(self.local_model_delete_btn)
+        return container
+
+    def _add_local_model_widget(self, layout, key, meta, category, sub_category):
+        item_layout = QHBoxLayout()
+        label = QLabel(f"{key.replace('_', ' ').capitalize()}:")
+        label.setFont(QFont('Segoe UI', 11))
+        label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+
+        widget = self.create_local_model_selector(
+            self.get_config_value(category, sub_category, key, meta),
+            meta,
+        )
+        help_button = self.create_help_button(meta.get('description', ''))
+
+        item_layout.addWidget(label)
+        item_layout.addWidget(widget)
+        item_layout.addWidget(help_button)
+        layout.addLayout(item_layout)
+
+        label.setObjectName(f"{category}_{sub_category}_{key}_label")
+        help_button.setObjectName(f"{category}_{sub_category}_{key}_help")
+        widget.setObjectName(f"{category}_{sub_category}_{key}_input")
+
+        self.model_cache_status_label = QLabel()
+        self.model_cache_status_label.setFont(QFont('Segoe UI', 10))
+        status_layout = QHBoxLayout()
+        status_layout.addSpacing(120)
+        status_layout.addWidget(self.model_cache_status_label)
+        status_layout.addStretch()
+        layout.addLayout(status_layout)
+
+        self.update_local_model_cache_status()
+
+    def get_selected_local_model_name(self):
+        combo = self.findChild(QComboBox, 'model_options_local_model_combo')
+        return combo.currentText() if combo else None
+
+    def update_local_model_cache_status(self, _model_name=None):
+        if not self.model_cache_status_label:
+            return
+        model_name = self.get_selected_local_model_name()
+        if not model_name:
+            self.model_cache_status_label.setText('')
+            return
+        if is_model_cached(model_name):
+            self.model_cache_status_label.setText(f"{model_name}: downloaded")
+            self.model_cache_status_label.setStyleSheet('color: #2e7d32;')
+        else:
+            self.model_cache_status_label.setText(f"{model_name}: not downloaded - click Download")
+            self.model_cache_status_label.setStyleSheet('color: #666;')
+
+    def _set_local_model_buttons_enabled(self, enabled):
+        if self.local_model_download_btn:
+            self.local_model_download_btn.setEnabled(enabled)
+        if self.local_model_delete_btn:
+            self.local_model_delete_btn.setEnabled(enabled)
+
+    def download_selected_local_model(self):
+        model_name = self.get_selected_local_model_name()
+        if not model_name:
+            return
+        if is_model_cached(model_name):
+            QMessageBox.information(
+                self,
+                'Already Downloaded',
+                f"{model_name} is already on disk.\n\nDelete it first if you want to re-download.",
+            )
+            return
+        self._run_local_model_action('download', model_name, f"Download {model_name}?")
+
+    def delete_selected_local_model(self):
+        model_name = self.get_selected_local_model_name()
+        if not model_name:
+            return
+        if not is_model_cached(model_name):
+            QMessageBox.information(self, 'Nothing to Delete', f"No cached files found for {model_name}.")
+            return
+        reply = QMessageBox.question(
+            self,
+            'Delete Model Cache',
+            f"Delete cached files for {model_name}?\n\nYou can download again with the Download button.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            self._run_local_model_action('delete', model_name)
+
+    def _run_local_model_action(self, action, model_name, confirm_message=None):
+        if self.local_model_worker_thread and self.local_model_worker_thread.isRunning():
+            QMessageBox.warning(self, 'Busy', 'A model download or delete is already in progress.')
+            return
+
+        if confirm_message:
+            reply = QMessageBox.question(
+                self,
+                'Download Model',
+                f"{confirm_message}\n\nThis may take several minutes and requires internet access.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        self._set_local_model_buttons_enabled(False)
+        if self.model_cache_status_label:
+            verb = 'Downloading' if action == 'download' else 'Deleting'
+            self.model_cache_status_label.setText(f"{verb} {model_name}...")
+            self.model_cache_status_label.setStyleSheet('color: #1565c0;')
+
+        worker = LocalModelWorker(action, model_name)
+        thread = QThread()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(lambda success, message: self._on_local_model_action_finished(success, message, thread, worker))
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self.local_model_worker_thread = thread
+        thread.start()
+
+    def _on_local_model_action_finished(self, success, message, thread, worker):
+        self.local_model_worker_thread = None
+        self._set_local_model_buttons_enabled(True)
+        self.update_local_model_cache_status()
+        if success:
+            QMessageBox.information(self, 'Model Cache', message)
+        else:
+            QMessageBox.warning(self, 'Model Cache', message)
 
     def create_line_edit(self, value, key=None, password_mode=False):
         widget = QLineEdit(value)
@@ -401,6 +563,12 @@ class SettingsWindow(BaseWindow):
 
     def save_setting(self, widget, category, sub_category, key, meta):
         """Save a single setting to the config."""
+        if category == 'model_options' and sub_category == 'local' and key == 'model':
+            combo = widget.findChild(QComboBox, 'model_options_local_model_combo')
+            if combo:
+                ConfigManager.set_config_value(combo.currentText(), category, sub_category, key)
+            return
+
         if isinstance(widget, QWidget) and widget.layout():
             layout = widget.layout()
             text_edit = None
@@ -503,6 +671,12 @@ class SettingsWindow(BaseWindow):
 
     def set_widget_value(self, widget, value, value_type):
         """Set the value of the widget."""
+        combo = widget.findChild(QComboBox, 'model_options_local_model_combo') if isinstance(widget, QWidget) else None
+        if combo:
+            combo.setCurrentText(str(value) if value is not None else '')
+            self.update_local_model_cache_status()
+            return
+
         if isinstance(widget, QCheckBox):
             widget.setChecked(value)
         elif isinstance(widget, QComboBox):
@@ -519,6 +693,10 @@ class SettingsWindow(BaseWindow):
 
     def get_widget_value_typed(self, widget, value_type):
         """Get the value of the widget with proper typing."""
+        combo = widget.findChild(QComboBox, 'model_options_local_model_combo') if isinstance(widget, QWidget) else None
+        if combo:
+            return combo.currentText() or None
+
         if isinstance(widget, QCheckBox):
             return widget.isChecked()
         elif isinstance(widget, QComboBox):
@@ -543,6 +721,8 @@ class SettingsWindow(BaseWindow):
     def toggle_api_local_options(self, use_api):
         """Toggle visibility of API and local options."""
         self.iterate_settings(lambda w, c, s, k, m: self.toggle_widget_visibility(w, c, s, k, use_api))
+        if self.model_cache_status_label:
+            self.model_cache_status_label.setVisible(not use_api)
 
     def toggle_widget_visibility(self, widget, category, sub_category, key, use_api):
         if sub_category in ['api', 'local']:

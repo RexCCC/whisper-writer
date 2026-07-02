@@ -1,227 +1,212 @@
+"""
+Aurora status HUD for WhisperWriter.
+
+A lightweight, robust, glowing status overlay that replaces the old stylesheet-
+pulsing window (which crashed Qt5Core with 0xc0000409 by re-parsing an hsla()
+stylesheet ~66x/second and churning the widget across threads).
+
+Design: a frameless, translucent, click-through glass pill, bottom-center.
+  - recording    -> warm coral dot with a breathing glow pulse
+  - transcribing  -> cool cyan->indigo rotating "comet" ring (processing)
+  - idle/error    -> hidden
+
+Robustness: the widget is created ONCE on the GUI thread and never destroyed.
+updateStatus() (a queued slot) only flips a state string + shows/hides; a single
+GUI-thread QTimer drives ALL painting. No cross-thread Qt calls, no stylesheet
+churn -> no more Qt fast-fail crashes.
+"""
 import sys
 import os
-from PyQt5.QtCore import Qt, pyqtSignal, pyqtSlot, QTimer
-from PyQt5.QtGui import QFont, QPixmap, QIcon
-from PyQt5.QtWidgets import QApplication, QLabel, QHBoxLayout, QVBoxLayout
+import math
+
+from PyQt5.QtCore import Qt, pyqtSignal, pyqtSlot, QTimer, QRectF
+from PyQt5.QtGui import (QColor, QPainter, QPen, QBrush, QFont,
+                         QRadialGradient, QConicalGradient, QPainterPath)
+from PyQt5.QtWidgets import QApplication, QWidget
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from ui.base_window import BaseWindow
-from utils import ConfigManager
+try:
+    from utils import ConfigManager
+except Exception:
+    ConfigManager = None
 
-class StatusWindow(BaseWindow):
+# ---- palette -------------------------------------------------------------
+GLASS_BG     = QColor(14, 17, 22, 194)      # deep charcoal, ~0.76 alpha
+GLASS_BORDER = QColor(255, 255, 255, 28)
+TOP_HILITE   = QColor(255, 255, 255, 40)
+TEXT_COLOR   = QColor(236, 239, 245)
+CORAL        = QColor(255, 90, 110)          # recording
+CORAL_GLOW   = QColor(255, 70, 92)
+CYAN         = QColor(77, 208, 225)          # processing (tail)
+INDIGO       = QColor(124, 108, 255)         # processing (head)
+IDLE_SLATE   = QColor(138, 148, 166)
+
+
+class StatusWindow(QWidget):
     statusSignal = pyqtSignal(str, bool)
     closeSignal = pyqtSignal()
 
     def __init__(self):
-        """
-        Initialize the status window.
-        """
-        super().__init__('WhisperWriter Status', 450, 100)
-        self.initStatusUI()
+        super().__init__()
+        self._mode = 'idle'          # 'idle' | 'recording' | 'processing'
+        self._label = ''
+        self._phase = 0.0            # breathing pulse (0..2pi)
+        self._angle = 0.0            # ring rotation (degrees)
+
+        self.setFixedSize(284, 66)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint |
+                            Qt.Tool | Qt.WindowTransparentForInput)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)   # click-through
+        self.setAttribute(Qt.WA_ShowWithoutActivating)       # never steal focus
+
+        self._font = QFont('Segoe UI', 11, QFont.Medium)
+
+        # single GUI-thread animation timer
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+
         self.statusSignal.connect(self.updateStatus)
-        
-        # Add timer for pulsing effect
-        self.warning_timer = QTimer()
-        self.warning_timer.timeout.connect(self.updateWarningPulse)
-        self.pulse_step = 0
-        self.pulse_direction = 1
 
-    def initStatusUI(self):
-        """
-        Initialize the status user interface.
-        """
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
-        
-        status_layout = QVBoxLayout()
-        status_layout.setContentsMargins(0, 0, 0, 0)
+    # ---- animation (GUI thread only) ------------------------------------
+    def _tick(self):
+        self._phase = (self._phase + 0.14) % (2 * math.pi)
+        self._angle = (self._angle + 7.0) % 360.0
+        self.update()
 
-        # Main status display (icon + status)
-        top_layout = QHBoxLayout()
-        
-        self.icon_label = QLabel()
-        self.icon_label.setFixedSize(32, 32)
-        microphone_path = os.path.join('assets', 'microphone.png')
-        pencil_path = os.path.join('assets', 'pencil.png')
-        self.microphone_pixmap = QPixmap(microphone_path).scaled(32, 32, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self.pencil_pixmap = QPixmap(pencil_path).scaled(32, 32, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self.icon_label.setPixmap(self.microphone_pixmap)
-        self.icon_label.setAlignment(Qt.AlignCenter)
-
-        self.status_label = QLabel('Recording...')
-        self.status_label.setFont(QFont('Segoe UI', 12))
-        
-        # Shortcuts label
-        self.shortcuts_label = QLabel()
-        self.shortcuts_label.setFont(QFont('Segoe UI', 9))
-        self.shortcuts_label.setStyleSheet("color: gray;")
-        self.shortcuts_label.setAlignment(Qt.AlignCenter)
-        self.shortcuts_label.hide()  # Hidden by default
-
-        top_layout.addStretch(1)
-        top_layout.addWidget(self.icon_label)
-        top_layout.addWidget(self.status_label)
-        top_layout.addStretch(1)
-
-        status_layout.addLayout(top_layout)
-        status_layout.addWidget(self.shortcuts_label)
-
-        self.main_layout.addLayout(status_layout)
-        
+    # ---- positioning ----------------------------------------------------
     def show(self):
-        """
-        Position the window in the bottom center of the screen and show it.
-        """
-        screen = QApplication.primaryScreen()
-        screen_geometry = screen.geometry()
-        screen_width = screen_geometry.width()
-        screen_height = screen_geometry.height()
-        window_width = self.width()
-        window_height = self.height()
-
-        x = (screen_width - window_width) // 2
-        y = screen_height - window_height - 120
-
+        screen = QApplication.primaryScreen().geometry()
+        x = (screen.width() - self.width()) // 2
+        y = screen.height() - self.height() - 120
         self.move(x, y)
         super().show()
-        
-    def closeEvent(self, event):
-        """
-        Emit the close signal when the window is closed.
-        """
-        self.closeSignal.emit()
-        super().closeEvent(event)
+        self.raise_()
+        if not self._timer.isActive():
+            self._timer.start(33)  # ~30 fps
 
-    def format_key_combo(self, key_combo: str) -> str:
-        """Convert key combination to symbolic representation."""
-        # Return empty string if key_combo is None
-        if not key_combo:
-            return ''
+    def _hide(self):
+        self._timer.stop()
+        self.hide()
 
-        key_map = {
-            'ctrl': 'CTRL',
-            'shift': 'SHIFT',
-            'alt': 'ALT',
-            'space': 'SPACE',
-            'win': 'WIN',
-            '+': '',  # Remove the plus signs between keys
-        }
-        
-        parts = key_combo.lower().split('+')
-        return ''.join(key_map.get(part, part.upper()) for part in parts)
+    # ---- painting -------------------------------------------------------
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
 
-    def updateWarningPulse(self):
-        """Update the warning background color for pulsing effect"""
-        if not self.isVisible():
-            self.warning_timer.stop()
-            return
-            
-        # Pulse between 20% and 100% saturation and vary lightness for dramatic effect
-        self.pulse_step += self.pulse_direction
-        if self.pulse_step > 80 or self.pulse_step < 0:  # Much wider range
-            self.pulse_direction *= -1
-            self.pulse_step += self.pulse_direction
-            
-        # Calculate color based on pulse step
-        saturation = 20 + self.pulse_step  # Much wider range from 20% to 100%
-        lightness = 100 - (self.pulse_step / 2)  # Vary lightness from 60% to 100%
-        
-        # print(f"[DEBUG] Pulse - Step: {self.pulse_step}, Saturation: {saturation}%, Lightness: {lightness}%")
-        
-        self.setStyleSheet(f"""
-            QWidget {{
-                background-color: hsla(48, {saturation}%, {lightness}%, 1.0);
-                border: 1px solid #FFE5A3;
-                border-radius: 5px;
-            }}
-            QLabel {{
-                background-color: transparent;
-                border: none;
-            }}
-            QPushButton {{
-                background-color: transparent;
-                border: none;
-            }}
-        """)
+        pad = 12.0
+        rect = QRectF(pad, pad, self.width() - 2 * pad, self.height() - 2 * pad)
+        radius = rect.height() / 2.0
 
+        if self._mode == 'recording':
+            accent = CORAL
+        elif self._mode == 'processing':
+            accent = INDIGO
+        else:
+            accent = IDLE_SLATE
+
+        # outer neon bloom (cheap blur via stacked translucent strokes)
+        for i in range(6, 0, -1):
+            a = int(9 * (i / 6.0) * (1.0 if self._mode != 'idle' else 0.4))
+            p.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), a), i * 2.2))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(rect.adjusted(-i, -i, i, i), radius + i, radius + i)
+
+        # glass body
+        path = QPainterPath()
+        path.addRoundedRect(rect, radius, radius)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(GLASS_BG))
+        p.drawPath(path)
+        # top highlight + hairline border
+        p.setPen(QPen(TOP_HILITE, 1.2))
+        p.drawLine(int(rect.left() + radius), int(rect.top() + 1),
+                   int(rect.right() - radius), int(rect.top() + 1))
+        p.setPen(QPen(GLASS_BORDER, 1.0))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(rect, radius, radius)
+
+        # indicator
+        cx = rect.left() + radius + 6
+        cy = rect.center().y()
+        if self._mode == 'recording':
+            self._paint_recording(p, cx, cy)
+        elif self._mode == 'processing':
+            self._paint_processing(p, cx, cy)
+
+        # label
+        p.setPen(QPen(TEXT_COLOR))
+        p.setFont(self._font)
+        text_rect = QRectF(cx + 20, rect.top(), rect.right() - (cx + 20) - 8, rect.height())
+        p.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, self._label)
+        p.end()
+
+    def _paint_recording(self, p, cx, cy):
+        bloom = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(self._phase))
+        r = 16.0
+        g = QRadialGradient(cx, cy, r)
+        g.setColorAt(0.0, QColor(CORAL_GLOW.red(), CORAL_GLOW.green(), CORAL_GLOW.blue(), int(150 * bloom)))
+        g.setColorAt(1.0, QColor(CORAL_GLOW.red(), CORAL_GLOW.green(), CORAL_GLOW.blue(), 0))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(g))
+        p.drawEllipse(QRectF(cx - r, cy - r, 2 * r, 2 * r))
+        dot = 4.6 + 0.8 * (0.5 + 0.5 * math.sin(self._phase))
+        p.setBrush(QBrush(CORAL))
+        p.drawEllipse(QRectF(cx - dot, cy - dot, 2 * dot, 2 * dot))
+
+    def _paint_processing(self, p, cx, cy):
+        r = 9.5
+        ring = QRectF(cx - r, cy - r, 2 * r, 2 * r)
+        grad = QConicalGradient(cx, cy, -self._angle)
+        grad.setColorAt(0.00, QColor(CYAN.red(), CYAN.green(), CYAN.blue(), 0))
+        grad.setColorAt(0.55, QColor(CYAN.red(), CYAN.green(), CYAN.blue(), 150))
+        grad.setColorAt(0.92, QColor(INDIGO.red(), INDIGO.green(), INDIGO.blue(), 255))
+        grad.setColorAt(1.00, QColor(INDIGO.red(), INDIGO.green(), INDIGO.blue(), 0))
+        p.setBrush(Qt.NoBrush)
+        p.setOpacity(0.35)                                   # soft under-glow
+        p.setPen(QPen(QBrush(grad), 6.0, Qt.SolidLine, Qt.RoundCap))
+        p.drawArc(ring, 0, 360 * 16)
+        p.setOpacity(1.0)                                    # crisp ring
+        p.setPen(QPen(QBrush(grad), 2.6, Qt.SolidLine, Qt.RoundCap))
+        p.drawArc(ring, 0, 360 * 16)
+
+    # ---- state (queued slot -> always runs on the GUI thread) -----------
     @pyqtSlot(str, bool)
     def updateStatus(self, status, use_llm=False):
-        """
-        Update the status window based on the given status.
-        """
         if status == 'recording':
-            self.icon_label.setPixmap(self.microphone_pixmap)
-            
-            # Check for continuous mode and remote API usage
-            continuous_mode = ConfigManager.get_config_value('recording_options', 'recording_mode') == 'continuous'
-            using_api = ConfigManager.get_config_value('model_options', 'use_api')
-            allow_continuous_api = ConfigManager.get_config_value('recording_options', 'allow_continuous_api')
-            
-            # Only check LLM settings if LLM mode is active
-            using_remote_api = using_api
-            if use_llm:
-                llm_type = ConfigManager.get_config_value('llm_post_processing', 'api_type')
-                using_remote_api = using_remote_api or (llm_type != 'ollama')
-            
-            # If continuous mode and remote API are being used but not allowed, force stop
-            if continuous_mode and using_remote_api and not allow_continuous_api:
-                print("[DEBUG] Continuous mode with remote API not allowed. Stopping recording.")
-                self.closeSignal.emit()  # This will trigger stop_result_thread in main.py
-                return
-            
-            if continuous_mode and using_remote_api:
-                print("[DEBUG] Setting warning status for continuous remote API usage")
-                self.status_label.setText('⚠️ Continuous Recording (Remote API) ⚠️')
-                self.status_label.setStyleSheet("")
-                self.pulse_step = 0
-                self.pulse_direction = 1
-                self.warning_timer.start(15)
-            else:
-                print("[DEBUG] Setting normal recording status")
-                self.status_label.setText('Recording...')
-                self.status_label.setStyleSheet("")  # Reset label color
-                self.setStyleSheet("")  # Reset window style
-                self.warning_timer.stop()  # Stop pulsing effect
-            
-            # Get shortcut keys and convert to symbols
-            activation_key = self.format_key_combo(ConfigManager.get_config_value('recording_options', 'activation_key'))
-            cleanup_key = self.format_key_combo(ConfigManager.get_config_value('recording_options', 'llm_cleanup_key'))
-            instruction_key = self.format_key_combo(ConfigManager.get_config_value('recording_options', 'llm_instruction_key'))
-            
-            # Format shortcuts with emojis and symbolic keys
-            shortcuts_text = f"⏹️ {activation_key} | 🧹 {cleanup_key} | 💭 {instruction_key}"
-            self.shortcuts_label.setText(shortcuts_text)
-            # self.shortcuts_label.show()
+            if ConfigManager is not None:
+                try:
+                    continuous = ConfigManager.get_config_value('recording_options', 'recording_mode') == 'continuous'
+                    remote = ConfigManager.get_config_value('model_options', 'use_api')
+                    allow = ConfigManager.get_config_value('recording_options', 'allow_continuous_api')
+                    if use_llm:
+                        remote = remote or (ConfigManager.get_config_value('llm_post_processing', 'api_type') != 'ollama')
+                    if continuous and remote and not allow:
+                        self.closeSignal.emit()   # safety guard preserved
+                        return
+                except Exception:
+                    pass
+            self._mode, self._label = 'recording', 'Listening'
             self.show()
-            
         elif status == 'transcribing':
-            self.icon_label.setPixmap(self.pencil_pixmap)
-            self.status_label.setText('Transcribing...')
-            self.shortcuts_label.hide()
-            
+            self._mode, self._label = 'processing', 'Transcribing'
+            self.show()
         elif status == 'processing_llm_cleanup':
-            self.icon_label.setPixmap(self.pencil_pixmap)
-            api_type = ConfigManager.get_config_value('llm_post_processing', 'api_type') or 'LLM'
-            self.status_label.setText(f'Cleaning up text with {api_type.upper()}...')
-            self.shortcuts_label.hide()
-            
+            self._mode, self._label = 'processing', 'Cleaning up'
+            self.show()
         elif status == 'processing_llm_instruction':
-            self.icon_label.setPixmap(self.pencil_pixmap)
-            api_type = ConfigManager.get_config_value('llm_post_processing', 'api_type') or 'LLM'
-            self.status_label.setText(f'Processing instruction with {api_type.upper()}...')
-            self.shortcuts_label.hide()
-
-        if status in ('idle', 'error', 'cancel'):
-            self.close()
+            self._mode, self._label = 'processing', 'Thinking'
+            self.show()
+        elif status in ('idle', 'error', 'cancel'):
+            self._mode = 'idle'
+            self._hide()
+            self.closeSignal.emit()   # preserves main.py's stop_result_thread flow
 
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
-    
-    status_window = StatusWindow()
-    status_window.show()
-
-    # Simulate status updates
-    QTimer.singleShot(3000, lambda: status_window.statusSignal.emit('transcribing', False))
-    QTimer.singleShot(6000, lambda: status_window.statusSignal.emit('idle', False))
-    
+    w = StatusWindow()
+    w.statusSignal.emit('recording', False)
+    QTimer.singleShot(2500, lambda: w.statusSignal.emit('transcribing', False))
+    QTimer.singleShot(6000, lambda: w.statusSignal.emit('idle', False))
     sys.exit(app.exec_())
